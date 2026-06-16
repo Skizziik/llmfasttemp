@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Models & weights (never commit, multi-GB)
+models/
+*.gguf
+*.safetensors
+*.bin
+weights/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / scratch
+*.log
+.cache/
+scratch/

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Presto 🎵 — playground</title>
+<style>
+  :root {
+    --bg: #0d0f14; --panel: #161a22; --panel2: #1d222c; --line: #272e3a;
+    --text: #e6e9ef; --muted: #8b94a7; --accent: #6ee7b7; --accent2: #38bdf8;
+    --user: #2a3550;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 18px;
+    border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header .logo { font-size: 20px; font-weight: 700; letter-spacing: .3px; }
+  header .logo .note { color: var(--accent); }
+  header .tag { color: var(--muted); font-size: 13px; }
+  .meter {
+    margin-left: auto; display: flex; gap: 18px; align-items: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .meter .stat { text-align: right; }
+  .meter .num { font-size: 20px; font-weight: 700; color: var(--accent); }
+  .meter .lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+  .backend { font-size: 12px; color: var(--muted); padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; }
+
+  #chat { flex: 1; overflow-y: auto; padding: 22px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 760px; width: 100%; margin: 0 auto; display: flex; gap: 12px; }
+  .msg .who { flex: 0 0 60px; color: var(--muted); font-size: 12px; padding-top: 3px; text-transform: uppercase; letter-spacing: .5px; }
+  .msg .body { flex: 1; white-space: pre-wrap; padding: 12px 14px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); }
+  .msg.user .body { background: var(--user); }
+  .msg.assistant .body { background: var(--panel2); }
+  .cursor::after { content: "▋"; color: var(--accent); animation: blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  footer { border-top: 1px solid var(--line); background: var(--panel); padding: 14px 18px; }
+  .composer { max-width: 760px; margin: 0 auto; display: flex; gap: 10px; }
+  textarea {
+    flex: 1; resize: none; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; padding: 11px 13px; font: inherit; min-height: 46px; max-height: 160px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent2); }
+  button {
+    background: var(--accent); color: #06281d; border: none; border-radius: 10px; padding: 0 20px;
+    font-weight: 700; cursor: pointer; font-size: 14px;
+  }
+  button.stop { background: #f87171; color: #2a0606; }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { max-width: 760px; margin: 8px auto 0; color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">Presto<span class="note"> ♪</span></div>
+    <div class="tag">instant small-model decoding · playground</div>
+    <div class="meter">
+      <div class="backend" id="backend">backend: …</div>
+      <div class="stat"><div class="num" id="toks">0</div><div class="lbl">tok/s</div></div>
+      <div class="stat"><div class="num" id="count">0</div><div class="lbl">tokens</div></div>
+    </div>
+  </header>
+
+  <div id="chat"></div>
+
+  <footer>
+    <div class="composer">
+      <textarea id="input" placeholder="Ask Presto something…  (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="send">Send</button>
+    </div>
+    <div class="hint" id="hint">Phase 0 — mock backend. The live tok/s meter is real; the words aren't (yet).</div>
+  </footer>
+
+<script>
+const chat = document.getElementById("chat");
+const input = document.getElementById("input");
+const sendBtn = document.getElementById("send");
+const toksEl = document.getElementById("toks");
+const countEl = document.getElementById("count");
+const backendEl = document.getElementById("backend");
+
+let streaming = false;
+let abort = null;
+
+fetch("/api/info").then(r => r.json()).then(i => {
+  backendEl.textContent = `backend: ${i.name}${i.real ? "" : " (mock)"}`;
+}).catch(() => {});
+
+function addMsg(who, text) {
+  const wrap = document.createElement("div");
+  wrap.className = "msg " + who;
+  wrap.innerHTML = `<div class="who">${who}</div><div class="body"></div>`;
+  wrap.querySelector(".body").textContent = text;
+  chat.appendChild(wrap);
+  chat.scrollTop = chat.scrollHeight;
+  return wrap.querySelector(".body");
+}
+
+async function send() {
+  if (streaming) { if (abort) abort.abort(); return; }
+  const prompt = input.value.trim();
+  if (!prompt) return;
+
+  addMsg("user", prompt);
+  input.value = "";
+  const body = addMsg("assistant", "");
+  body.classList.add("cursor");
+
+  streaming = true;
+  sendBtn.textContent = "Stop";
+  sendBtn.classList.add("stop");
+  abort = new AbortController();
+
+  let n = 0;
+  const t0 = performance.now();
+  try {
+    const res = await fetch("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, max_tokens: 256 }),
+      signal: abort.signal,
+    });
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 2);
+        if (!line.startsWith("data:")) continue;
+        const obj = JSON.parse(line.slice(5).trim());
+        if (obj.done) {
+          toksEl.textContent = obj.tok_s;
+          countEl.textContent = obj.tokens;
+        } else {
+          body.textContent += obj.t;
+          n++;
+          countEl.textContent = n;
+          const secs = (performance.now() - t0) / 1000;
+          if (secs > 0) toksEl.textContent = (n / secs).toFixed(1);
+          chat.scrollTop = chat.scrollHeight;
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") body.textContent += `\n[error: ${e.message}]`;
+  } finally {
+    body.classList.remove("cursor");
+    streaming = false;
+    sendBtn.textContent = "Send";
+    sendBtn.classList.remove("stop");
+    abort = null;
+  }
+}
+
+sendBtn.addEventListener("click", send);
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.focus();
+</script>
+</body>
+</html>
