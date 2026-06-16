@@ -105,15 +105,26 @@ accepted this step) so the playground can *visualize* speculation live. We swap
 backends — mock → reference → Presto — without touching the server or UI, and
 benchmark them against each other in the same chat window.
 
-## 5. Phase plan
+## 5. Phase plan — TMS (Telescoping Matryoshka Speculation)
 
-- **Phase 0 — playground** *(now)*: stdlib server + browser chat + live tok/s,
-  running on a mock backend. UX loop is real; engine is stubbed.
-- **Phase 1 — reference backend**: load real E4B (transformers/candidate) so we
-  have correct outputs and an honest **baseline** to beat.
-- **Phase 2 — Presto core**: own CUDA decode loop, Q4 weights, KV-cache,
-  autoregressive parity with the reference.
-- **Phase 3 — Matryoshka self-speculation**: E2B drafts, E4B verifies. Measure
-  acceptance length and tok/s.
-- **Phase 4 — tree verify + adaptive + n-gram + CUDA graphs**: stack the rest,
-  benchmark each increment honestly in the UI.
+Plan adopted from [docs/TMS-research.txt](docs/TMS-research.txt); supersedes the
+earlier E2B-as-drafter plan (see the banner in [RESEARCH.md](RESEARCH.md)).
+
+- **Phase 0 — playground + de-risk** *(done)*: stdlib server + browser chat +
+  live tok/s on a mock backend; honest llama.cpp baseline **62.12 tok/s**;
+  byte-roofline (η≈0.56, ceiling ~110 tok/s — see
+  [docs/PHASE0-findings.md](docs/PHASE0-findings.md)). Confirms speculative
+  decoding is the only big lever.
+- **Phase 1 — lossless MTP core** *(next)*: MTP head → E4B speculative decoding
+  with EAGLE-2-style dynamic tree verification. Reproduce the ~2.6–3× lossless
+  floor. **Gating task:** mainline llama.cpp lacks `--mtp-head`; needs an
+  MTP-capable fork build (`ik_llama.cpp`/`reffdev`).
+- **Phase 2 — telescoping qualifier (C1/C2)**: insert the nested-shell staircase
+  as a byte-incremental fused kernel between MTP and E4B. Lossless. Contingent on
+  the Phase-0c byte test (E2B `c` ≤ 0.55, fused FFN byte-savings ≥ 25%).
+- **Phase 3 — entropy-gated verification-free runs (C3) + PLE prefetch (C4)**:
+  conformal calibration with user-tunable δ; the lossy lever toward ~4–5×.
+- **Phase 4 — online single-user self-distillation (C5)**: per-session LoRA on
+  the MTP head + adaptive thresholds; lift acceptance over a session.
+
+Kill-criteria and thresholds are inherited verbatim from the TMS doc.

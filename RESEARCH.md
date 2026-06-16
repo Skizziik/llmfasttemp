@@ -1,5 +1,16 @@
 # Presto — Research Note: where the speed actually hides
 
+> ⚠️ **SUPERSEDED / CORRECTED by [docs/TMS-research.txt](docs/TMS-research.txt).**
+> This note proposed "Ladder Speculation" with the **E2B shell as the primary
+> drafter**. That lever is *mathematically weak*: E2B is a width cut that still
+> reads all attention + shared FFN bytes at full depth, so its draft-cost ratio
+> is c≈0.6–0.7 → speedup caps near ~1.18× even at α=0.95 (Leviathan). **Adopt
+> TMS instead:** the cheap drafter is the **MTP head** (c≈0.05); the nested
+> shells become *zero-VRAM intermediate qualifiers*, not the draft; the novel
+> core is **telescoping byte-incremental fused verification** plus an
+> entropy-gated, conformally-calibrated verification-free fast path. The survey
+> below is still valid as the field map; only the "our bet" section is replaced.
+
 Senior-level survey of the LLM-inference acceleration literature (as of mid-2026),
 written for one concrete target: **Gemma 4 E4B (MatFormer) on a single 8 GB GPU,
 batch size 1**. The goal is to find a genuinely unoccupied idea that fits *this*
