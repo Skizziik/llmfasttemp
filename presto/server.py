@@ -25,8 +25,19 @@ from .backends.mock import MockBackend
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.normpath(os.path.join(HERE, "..", "web"))
 
-# The active backend. Swap this line to mount the real engine later.
-BACKEND = MockBackend()
+
+def _make_backend():
+    """Select backend via PRESTO_BACKEND (mock | llamacpp). Defaults to mock so
+    the playground always runs with zero setup; set llamacpp to chat with the
+    real model through a running llama-server (see backends/llamacpp.py)."""
+    kind = os.environ.get("PRESTO_BACKEND", "mock").lower()
+    if kind == "llamacpp":
+        from .backends.llamacpp import LlamaCppBackend
+        return LlamaCppBackend()
+    return MockBackend()
+
+
+BACKEND = _make_backend()
 
 
 class Handler(BaseHTTPRequestHandler):

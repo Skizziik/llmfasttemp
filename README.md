@@ -38,6 +38,17 @@ python -m presto.server
 You'll get a chat UI with a live tokens/sec readout. The backend is a mock until
 the engine lands — but the loop, streaming, and benchmark plumbing are real.
 
+### Chat with the real model
+
+Start a `llama-server` on the Gemma 4 GGUF, then point the playground at it:
+
+```bash
+llama-server -m gemma-4-E4B-it-Q4_K_M.gguf -ngl 99 -c 4096 --jinja --port 8080
+PRESTO_BACKEND=llamacpp PRESTO_LLAMA_URL=http://127.0.0.1:8080 python -m presto.server
+```
+
+Now the browser playground streams real Gemma 4 E4B tokens with live tok/s.
+
 ## Layout
 
 ```
