@@ -1,0 +1,80 @@
+{
+  "description": "Presto standard evaluation suite (FROZEN v1). Fixed prompts asked identically to every backend/version so we compare BOTH speed (tok/s, latency, VRAM) AND answer quality across engine iterations. Categories deliberately span the entropy spectrum: low-entropy/repetitive content (code, lists, JSON) is where speculative decoding accepts long drafts; high-entropy creative/reasoning content is where it accepts little. This spread is what later validates Ladder Speculation. Prompts are length-bounded so they complete (finish_reason=stop) within the token caps.",
+  "decoding": {
+    "temperature": 0.0,
+    "enable_thinking": false,
+    "comment": "Greedy + thinking disabled (chat_template_kwargs.enable_thinking=false, server run with --jinja). Deterministic, directly comparable across engine versions; no separate chain-of-thought channel."
+  },
+  "prompts": [
+    {
+      "id": "code_fib",
+      "category": "code",
+      "entropy": "low",
+      "max_tokens": 512,
+      "prompt": "Write a Python function `fib(n)` that returns the nth Fibonacci number using memoization. Return only the code in a single code block."
+    },
+    {
+      "id": "json_book",
+      "category": "structured",
+      "entropy": "low",
+      "max_tokens": 300,
+      "prompt": "Return a single JSON object describing a book with fields: title (string), author (string), year (integer), genres (array of strings). Output only valid JSON, no commentary."
+    },
+    {
+      "id": "list_primes",
+      "category": "list",
+      "entropy": "very-low",
+      "max_tokens": 200,
+      "prompt": "List the first 20 prime numbers as a single comma-separated line, nothing else."
+    },
+    {
+      "id": "reason_batball",
+      "category": "reasoning",
+      "entropy": "medium",
+      "max_tokens": 600,
+      "prompt": "A bat and a ball cost $1.10 in total. The bat costs $1.00 more than the ball. How much does the ball cost? Show your working briefly, then give the final answer."
+    },
+    {
+      "id": "fact_capital",
+      "category": "factual",
+      "entropy": "low",
+      "max_tokens": 64,
+      "prompt": "What is the capital of Australia? Answer with just the city name."
+    },
+    {
+      "id": "prose_lighthouse",
+      "category": "creative",
+      "entropy": "high",
+      "max_tokens": 400,
+      "prompt": "Write a four-sentence story about a lighthouse keeper who befriends a whale. Exactly four sentences."
+    },
+    {
+      "id": "explain_hashmap",
+      "category": "explanation",
+      "entropy": "medium",
+      "max_tokens": 300,
+      "prompt": "Explain how a hash map works and why average lookup is O(1), in exactly three sentences."
+    },
+    {
+      "id": "summarize_photosynthesis",
+      "category": "summarization",
+      "entropy": "medium",
+      "max_tokens": 256,
+      "prompt": "Summarize the following in two sentences: Photosynthesis is the process by which green plants, algae, and some bacteria convert light energy, usually from the sun, into chemical energy stored in glucose. It takes place mainly in the chloroplasts using the pigment chlorophyll, consumes carbon dioxide and water, and releases oxygen as a byproduct."
+    },
+    {
+      "id": "ru_blackhole",
+      "category": "multilingual-ru",
+      "entropy": "medium",
+      "max_tokens": 400,
+      "prompt": "Объясни простыми словами в двух предложениях, что такое чёрная дыра."
+    },
+    {
+      "id": "longform_watercycle",
+      "category": "long-form",
+      "entropy": "medium",
+      "max_tokens": 500,
+      "prompt": "Describe the water cycle in about 120 words, covering evaporation, condensation, precipitation, and collection."
+    }
+  ]
+}

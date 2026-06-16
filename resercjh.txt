@@ -1,0 +1,129 @@
+Presto-TMS: Telescoping Matryoshka Speculation — A Novel Memory-Bandwidth-Optimal Decoding Mechanism for Gemma 4 E4B on 8 GB GPUs
+
+TL;DR
+
+
+The mechanism we propose — Telescoping Matryoshka Speculation (TMS) — exploits three structural properties of Gemma 4 E4B that no existing engine combines: (1) the continuum of nested FFN shells (not just E2B-vs-E4B) used as a fused, byte-incremental verification staircase; (2) the official MTP drafter as the cheapest cascade stage; and (3) an entropy-gated, conformally-calibrated "verification-free run" fast path that spends the entire 1–2% quality budget where it buys the most speed. A lossless cascade alone realistically reaches ~2.5–3.5× on a 4B-class model; the entropy-gated lossy fast path is the necessary component that pushes toward ~5×.
+The user's existing bet — plain "E2B-as-draft" self-speculation — is mathematically weak and must be abandoned as the primary lever. Because E2B is a width subset that still reads all attention weights and shared FFN neurons at full depth, its draft-cost ratio is only c≈0.6–0.7, which caps speedup near ~1.1–1.2× even at 90%+ acceptance. The cheap drafter must instead be the MTP head (c≈0.05); the nested shells become intermediate verifiers/qualifiers, not the primary draft.
+On an RTX 4060 (272 GB/s, 8 GB), the path to ~5× is: MTP head proposes a token tree (c≈0.05) → nested shells filter it cheaply → E4B verifies losslessly in one weight-read → high-confidence runs short-circuit E4B via a calibrated statistical accept. We give the math, the novelty contrast, the failure modes, and a four-phase CUDA implementation plan.
+
+
+Key Findings
+
+
+Single-stream decode is memory-bandwidth bound, and the only large lever is verified-tokens-per-weight-read. At batch 1, decode arithmetic intensity is ~1–2 FLOP/byte, 200–600× below the roofline; every token requires reading the full weight set from VRAM. The target hardware — the NVIDIA RTX 4060 (AD107), 8 GB GDDR6 at 17 Gbps over a 128-bit interface = 272 GB/s, with a 24 MB L2 cache that NVIDIA claims makes effective bandwidth "roughly equivalent to an Ampere GPU with 453 GB/s" — means a ~4B-param model at Q4 (~2 GB of weights) has a naive ceiling near ~130 weight-reads/s, degraded to a realistic ~60–90 tok/s by KV traffic, PLE paging, and kernel overhead. The 24 MB L2 directly raises the η hardware-efficiency factor in the model below. Speedup = (1−α^(γ+1)) / [(1−α)(γc+1)] (Leviathan et al.); the two knobs are acceptance α and draft-cost ratio c.
+The official Gemma 4 MTP drafter already delivers up to ~3× losslessly and is the correct cheapest stage. Google's MTP drafters (released May 5, 2026) share the target's input embeddings, condition on the target's last-layer activations, and share KV cache — giving a draft-cost ratio of roughly c≈0.05 and "up to 3×" decode speedup with no quality change. This is the foundation Presto must build on, not replace. Google
+Plain Matryoshka self-speculation is provably limited because the nested submodel is a width cut, not a cheap model. Gemma 4 E4B's FFN nests from the E2B hidden dimension (≈half) up to the full E4B dimension; the FFN is the majority of non-embedding parameters, but attention, embeddings, and the shared "most-significant" FFN neurons are read in full by every shell. The E2B shell therefore reads on the order of ~0.6–0.7 of E4B's per-token bytes (c≈0.6–0.7). With c≈0.7, even α=0.95 and γ=5 yields only ≈1.18× — confirming that the nested shell cannot serve as the primary cheap drafter.
+But the nested shells are an ideal, zero-VRAM intermediate qualifier, and the literature shows intermediate-size qualifiers raise acceptance. PyramidSD (Byun et al., arXiv:2510.12966), using a Llama-3.2-1B draft / 3.2-3B qualifier / 3.1-8B target on an RTX 4090 24 GB (CSQA, temp 0.7), "achieves up to 1.91× generation speed over standard SD, reaching 124 tokens per second on a consumer GPU," and documents a smooth entropy gradient from small→large models. MatFormer's own authors report that nested submodels are substantially more consistent with the full model than independently-trained baselines (≈5–10% higher token-agreement / lower KL across sizes) and that this yields a ~6% speculative-decoding speedup plus an attention-cache-sharing bonus where the verifier overwrites the draft's cache with richer representations (MatFormer, arXiv:2310.07707, §4.1.1 and Appendix C.1). Presto gets these qualifiers free in VRAM because they are literally sub-blocks of E4B. arxiv
+Draft-side entropy is a calibrated predictor of token acceptance — this is the basis of the lossy fast path. SVIP (Zhang et al., arXiv:2411.18462) shows high draft entropy ⇒ low acceptance and derives an acceptance lower bound from entropy, reporting "up to 17% speedup on MT-Bench... and 22% on AIME" (long-form reasoning). AdaEDL (arXiv:2410.18351) gives a training-free entropy lower bound on token acceptance probability. CALM (Schuster et al., arXiv:2207.07061) established conformal/distribution-free risk control for per-token early-exit with provable global quality guarantees (up to 3× compute reduction). These let us short-circuit full E4B verification on high-confidence runs with a bounded error rate. arxiv
+Single-user, single-stream is a gift: the running distribution is narrow and the drafter can be self-distilled online. Online Speculative Decoding (arXiv:2310.07177) raises acceptance by 0.1–0.65 by adapting the draft to the live query distribution; AdaSPEC (arXiv:2510.19779) shows acceptance-targeted (not KL-targeted) distillation adds up to 15% acceptance. For one user, a tiny LoRA on the MTP head can climb acceptance over a session at negligible cost.
+
+
+Details: The Telescoping Matryoshka Speculation (TMS) Mechanism
+
+Problem framing
+
+For memory-bound decode, tokens/sec ≈ (BW / bytes_read_per_token) × accepted_tokens_per_pass. We attack both factors simultaneously, using only structure already present in Gemma 4 E4B (the MatFormer FFN nesting continuum, the PLE paging schedule, and the official MTP drafter), so the mechanism adds zero hot-weight VRAM.
+
+Component C1 — A continuum of nested shells as a draft/verify staircase
+
+MatFormer's Mix-n-Match lets us instantiate, for free and from one weight set, a graded ladder of shells of increasing FFN width, e.g.:
+
+
+S0 = MTP head (the official Gemma 4 drafter; c≈0.05) — the cheap proposer.
+S1 = E2B shell (≈half FFN width; c≈0.6) — first qualifier.
+S2 = an intermediate Mix-n-Match shell (e.g. ¾ FFN width; c≈0.8) — second qualifier (optional).
+S3 = E4B full model (c=1) — the lossless verifier.
+
+
+The MTP head proposes a token tree; each higher shell re-scores and prunes the tree before passing the survivors upward. This is the PyramidSD "qualifier" idea, but the qualifiers cost no extra VRAM and partially share bytes with the verifier.
+
+Component C2 — Telescoping (byte-incremental) fused verification
+
+This is the core architectural novelty. Because shell S_i's weight matrices are a strict sub-block of S_(i+1)'s (the first m FFN neurons are shared by all shells), a single fused CUDA kernel can evaluate the cascade so that moving from shell S_i to S_(i+1) reads only the incremental FFN-neuron columns not already resident, rather than re-reading a whole independent model. In existing cascades (CS-Drafting, PyramidSD, CAS-Spec) the draft models are independent weight sets, so each stage pays a full, separate weight-read; here the reads are additive along the nesting axis. We also inherit MatFormer's attention-cache sharing (Appendix C.1): the qualifier and verifier share K/V, and the verifier overwrites the draft's cache with its richer representation at no extra compute. The intended effect: the qualifier filtering that raises acceptance is nearly free in bytes, because its bytes are a prefix of the bytes E4B must read anyway. arxiv
+
+Component C3 — Entropy-gated shell routing + the verification-free run (the lossy lever)
+
+Per drafted token, S0's prediction entropy H is computed (free; it is a by-product of the draft softmax). We define two calibrated thresholds via split-conformal calibration (CALM-style) over a short warmup:
+
+
+H < τ_low (high confidence): the token enters a verification-free run — it is accepted on the smallest shell's say-so without invoking E4B, under a conformal guarantee that the run-level disagreement rate with E4B stays below a user-set δ (e.g. 1–2%). Runs are capped in length and periodically "spot-checked" by E4B to keep the empirical error inside δ.
+τ_low ≤ H < τ_high: escalate one shell (E2B/intermediate qualifier) for cheap filtering, then E4B verifies.
+H ≥ τ_high (genuinely uncertain): go straight to full E4B lossless verification; do not waste draft passes.
+
+
+The verification-free run is where the entire 1–2% quality budget is deliberately spent, and only there — it is the component that converts a ~3× lossless cascade into a ~5× system, because it removes E4B weight-reads entirely on the easy majority of tokens (function words, code boilerplate, copied spans). SVIP/AdaEDL supply the entropy→acceptance lower bound; CALM supplies the distribution-free error control.
+
+Component C4 — PLE-prefetch / draft-compute overlap
+
+Gemma 4's Per-Layer Embeddings live outside hot weight memory and are paged in per layer. While S0/S1 draft (light on weight bytes), the runtime prefetches the next E4B layer's PLE vectors and the incremental FFN-neuron columns the verifier will need, hiding verifier memory latency behind draft compute. The PLE paging schedule becomes a scheduling oracle that tells the prefetcher exactly which bytes to stage next — a Gemma-specific overlap no general engine performs.
+
+Component C5 — Online single-user self-distillation of the drafter
+
+Because Presto serves one user/one stream, a tiny LoRA adapter on the MTP head is updated online against E4B's verified outputs (acceptance-targeted, AdaSPEC-style), so α climbs over a session (Online SD reports +0.1–0.65). This also adapts τ_low/τ_high as the conformal calibration set grows.
+
+Mathematical model and the conditions for ~5×
+
+Let E4B read B_v bytes/step; BW the GPU bandwidth; baseline AR throughput R_0 = BW/B_v (× a hardware-efficiency factor η≈0.5–0.7, raised here by the RTX 4060's 24 MB L2). For a two-stage effective cascade with cheap proposer cost c≈0.05 and tree verification, the lossless per-E4B-pass yield is the tree-extended Leviathan expectation E[tokens] = (1−α^(γ+1))/(1−α). With α≈0.75–0.8 (MTP-class) and a dynamic tree of depth γ≈5–7 plus qualifier filtering raising effective α toward ~0.85, E[tokens]≈4–5 per E4B weight-read, and draft overhead γc≈0.25–0.35:
+
+Speedup_lossless ≈ E[tokens] / (1 + γc + ε_qual) ≈ 4.5 / 1.3 ≈ 2.7–3.5×,
+
+consistent with Google's measured "up to 3×" for MTP. (For calibration: EAGLE-3, per Li et al., arXiv:2503.01840, Table 1 at temp 0, ranges 3.27×–6.47× — but note the highest figure, 6.47×, is on a 13B model (Vicuna-13B, HumanEval) and the lowest, 3.27×, is on the 70B (LLaMA-3.3-70B, CNN/DM); EAGLE-3's gains are not monotone in model size, so its high end is not a 4B reference.) The ~2.7–3.5× is the honest lossless ceiling for our 4B target.
+
+Now add the verification-free fast path covering a fraction f of tokens that bypass E4B entirely (B_v→~B_v·c_eff on those tokens). The effective E4B byte-reads per output token drop by factor (1−f·(1−c_eff)). With f≈0.45 of tokens being high-confidence (entropy-justified) and c_eff≈0.6 (E2B shell carries them):
+
+Speedup_total ≈ Speedup_lossless / (1 − f(1−c_eff)) ≈ 3.0 / (1 − 0.45·0.4) ≈ 3.0/0.82 ≈ 3.7×, rising to ~4.5–5× when (a) online distillation lifts α, (b) f rises on copy-heavy/boilerplate workloads, and (c) PLE/FFN-incremental prefetch hides verifier latency so η improves.
+
+The ~5× target is reachable only when all three conditions hold simultaneously: high acceptance (α≳0.85 effective, achieved via MTP + qualifier + online distillation), a substantial verification-free fraction (f≳0.4, workload-dependent, highest on code/summarization/chat with prompt overlap), and effective prefetch overlap. On adversarial, high-entropy reasoning streams, f→0 and the system degrades gracefully to the ~3× lossless cascade.
+
+Why it preserves quality
+
+The lossless portion (C1/C2/C4) changes nothing about E4B's output distribution — speculative verification is exact, and MatFormer's attention-cache sharing is benign. All quality risk is isolated in C3's verification-free runs, which are governed by a conformal threshold with an explicit, user-tunable miscoverage δ. Setting δ=1–2% spends exactly the stated budget; the spot-check mechanism re-calibrates if empirical disagreement drifts. The degradation is concentrated on tokens the smallest shell is most confident about, which are exactly the tokens where E2B and E4B already agree most (MatFormer's 5–10% higher consistency means the smallest shell rarely disagrees with E4B on low-entropy tokens) — so the realized quality loss is typically well under the budget.
+
+Why it is novel (contrast with the closest existing methods)
+
+
+vs. Google MTP drafter (the 3× baseline): MTP sends drafts straight to E4B. TMS interposes the free nested-shell qualifier staircase and the entropy-gated verification-free path, attacking both α and the E4B byte-reads. MTP does neither.
+vs. CS-Drafting / PyramidSD / CAS-Spec (cascades): All use independent draft models (or layer-sparsity/quant variants) whose stages pay full, separate weight-reads, and none exploit physical weight nesting for byte-incremental fused verification. PyramidSD's qualifier costs extra VRAM; TMS's qualifiers are sub-blocks of the verifier (zero extra VRAM, shared bytes, shared KV). CAS-Spec (arXiv:2510.26843) builds drafts via layer sparsity/quantization, not via a natively-trained nested continuum, so its qualifiers are lower-quality and lossless-only.
+vs. LayerSkip / Kangaroo / Draft&Verify / SWIFT (self-speculation): These do depth early-exit on a single model (Kangaroo ≤2.04×, LayerSkip up to 2.16× on summarization); TMS does width nesting (MatFormer) — a different and complementary axis that is natively trained for consistency, plus it adds the multi-stage qualifier and the lossy fast path.
+vs. MatFormer's own SD experiment: MatFormer (arXiv:2310.07707) used a single nested submodel as draft for a ~6% speedup and noted attention-cache sharing, but never proposed a multi-shell cascade, never gated by entropy, never combined with MTP heads, and never used a verification-free run. TMS is the first to treat the full Matryoshka granularity continuum as a telescoping verification chain.
+vs. SpecExit / CALM / SVIP / AdaEDL: These provide the entropy/conformal machinery TMS reuses for C3, but apply it to draft-length or reasoning-exit decisions, not to shell selection or a verification-free statistical-accept fast path on a nested-width hierarchy.
+
+
+The gap TMS fills: no existing engine treats a natively-nested width continuum as a byte-incremental, KV-sharing verification staircase, fed by an MTP head and gated by a conformally-calibrated entropy router that selectively bypasses the full verifier.
+
+Failure modes, risks, and kill criteria
+
+
+High draft-cost ratio of the shells (the central risk): if the E2B/intermediate shell's c stays near 0.6–0.7, the qualifier stage may not pay for itself. Kill criterion: if measured per-token bytes for the E2B shell exceed ~0.55×E4B in the fused kernel, drop intermediate shells and run MTP→E4B with only C3/C4. Measure this first.
+Telescoping kernel may not realize byte savings: if GPU memory layout forces re-reading shared FFN columns rather than reusing them in cache/registers, C2's advantage collapses to a normal cascade. Validation: microbenchmark the fused incremental-FFN kernel vs. two separate forward passes; require ≥25% byte reduction.
+Entropy is a weak acceptance predictor on this model/workload: if low-entropy tokens are not reliably accepted by E4B, the verification-free path either loses too much quality or must be set so conservatively (f→0) that it adds nothing. Validation: offline, measure P(E4B-accept | H<τ) on the user's traffic; require ≥98% to license a 2% δ.
+PLE paging is bandwidth-bound itself: if PLE traffic over PCIe/host competes with weight reads, prefetch overlap yields little. Validation: profile PCIe vs. VRAM bandwidth utilization during decode.
+Tree verification overhead on a small model: tree attention masks and position_ids add fixed cost that is proportionally larger on a 4B model than on 70B. The ml-explore/mlx-lm EAGLE-3 prototype (GitHub Discussion #890) found that for a 4-bit 8B model at ~114 tok/s, a 0.34 acceptance rate yielded only ~1.05× because "per-token time is already fast enough that draft overhead struggles to pay for itself." The tree must therefore be shrunk dynamically (EAGLE-2-style). Kill criterion: if dynamic-tree net speedup < chain-draft speedup, disable trees.
+Quantization interaction: Q4 weights + the nested-FFN sub-block extraction must remain numerically faithful; per-shell calibration may be needed. Validation: check that the Q4 E2B shell's logits track the Q4 E4B logits within the consistency band MatFormer reports.
+
+
+What measurements validate or kill it
+
+Run these in order; each gates the next: (1) baseline E4B Q4 tok/s and per-token byte accounting on the RTX 4060; (2) MTP-only speedup (reproduce Google's ~3×); (3) shell c measurement in the fused kernel; (4) offline P(accept | entropy) calibration curves; (5) end-to-end TMS speedup and benchmark deltas (MMLU/GSM8K/HumanEval) at δ=0%, 1%, 2%. The mechanism is validated if end-to-end speedup ≥4× at ≤2% benchmark loss on at least chat+code workloads; it is killed if it cannot beat MTP-only by ≥30% at ≤2% loss after online distillation warms up.
+
+Recommendations (staged)
+
+
+Phase 0 — Instrument and de-risk (do this before building anything). Build the byte-accurate roofline model for Gemma 4 E4B Q4/Q5 on the target 8 GB GPU; reproduce MTP-only ~3×; measure the E2B shell's true c in a fused kernel. Threshold to proceed to qualifiers: E2B c ≤ 0.55 and fused-incremental-FFN byte savings ≥ 25%. If not met, ship MTP + C3 + C4 only (still likely ~3.5–4×).
+Phase 1 — Lossless core. Implement MTP→E4B speculative decoding with EAGLE-2-style dynamic tree verification and MatFormer attention-cache sharing. Target: match/beat Google's 3× losslessly. This is the safe floor.
+Phase 2 — Telescoping qualifier (C1/C2). Add the nested-shell staircase as a byte-incremental fused kernel between MTP and E4B. Keep it lossless. Target: +20–40% over Phase 1 (PyramidSD-class, which hit 1.91× over standard SD), contingent on the Phase 0 byte test.
+Phase 3 — Entropy-gated verification-free runs (C3) + PLE prefetch (C4). Add conformal calibration with δ as a user knob; add PLE/FFN-incremental prefetch overlap. Target: push to 4–5× on favorable workloads at ≤2% loss. Benchmark that changes the plan: if δ=2% yields <15% extra speedup over Phase 2, the lossy path isn't worth its complexity — keep the system lossless and stop at ~3.5×.
+Phase 4 — Online self-distillation (C5). Ship the per-session LoRA on the MTP head and adaptive thresholds. Target: recover acceptance on the user's specific distribution, lifting f and α over time.
+
+
+Thresholds that flip decisions: abandon nested-shell qualifiers if c>0.55; abandon the lossy fast path if P(accept|low-entropy)<98% or if its marginal speedup <15%; abandon trees if they net-lose on the 4B model; in all cases the MTP+prefetch core remains a solid ~3–3.5× product.
+
+Caveats
+
+
+Nomenclature/version risk: Public sources describe both "Gemma 3n" (E2B/E4B, MatFormer, PLE, FFN nesting 8192→16384, ~5.44B params) and a "Gemma 4" family (E2B/E4B edge models continuing MatFormer/PLE, plus 31B/26B-A4B, with official MTP "assistant" drafters released May 5, 2026 reporting up to 3×). The structural facts this proposal relies on (FFN width nesting, PLE paging, shared-KV, official MTP drafter, memory-bandwidth-bound decode) hold across both; exact E4B layer counts, FFN dims, and the precise E2B byte ratio must be confirmed against the shipped checkpoint config before the Phase-0 math is finalized.
+The headline ~6% MatFormer SD speedup and ~5–10% consistency figures come partly from author-affiliated summaries of arXiv:2310.07707; the precise Table 2 cells should be read from the PDF before being quoted as hard numbers. MatFormer's published scaling experiments topped out at ≤2.6B params, so its consistency/speedup numbers are an analogy for the 4B regime, not a measurement of it.
+All speedup projections are model-derived, not measured on Presto. The 5× target is explicitly conditional (high α, f≳0.4, working prefetch); on high-entropy reasoning workloads expect the ~3× lossless floor. Small (4B) models structurally yield less than the headline figures of large-model speculative-decoding papers because fixed per-step overheads (tree masks, sampling, kernel launches) are a larger fraction of a cheaper forward pass — documented concretely in the mlx-lm EAGLE-3 prototype (Discussion #890), where these overheads collapsed a 0.34 acceptance rate to only ~1.05×.
+The lossy component is genuinely lossy. The conformal guarantee bounds expected disagreement at δ, not worst-case per-prompt behavior; safety-critical or exact-reproducibility use cases should run δ=0 (lossless mode), accepting ~3–3.5×.
+MoE caveat does not apply here (E4B is dense), but if Presto ever targets the 26B-A4B MoE, expert-loading at batch 1 can erase MTP gains — a documented Gemma 4 limitation.
