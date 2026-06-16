@@ -55,8 +55,11 @@ def gpu_mem_used_mib() -> int | None:
 
 # --- llama.cpp server runner --------------------------------------------
 class LlamaServerRunner:
-    def __init__(self, gguf: str, port: int, ngl: int, ctx: int):
+    def __init__(self, gguf: str, port: int, ngl: int, ctx: int,
+                 bin_dir: str = LLAMA_BIN_DIR, extra_args: list | None = None):
         self.gguf, self.port, self.ngl, self.ctx = gguf, port, ngl, ctx
+        self.bin_dir = bin_dir
+        self.extra_args = extra_args or []
         self.proc = None
         self.base = f"http://127.0.0.1:{port}"
         self.build = "unknown"
@@ -64,7 +67,7 @@ class LlamaServerRunner:
         self.mem_loaded = None
 
     def __enter__(self):
-        exe = os.path.join(LLAMA_BIN_DIR, "llama-server.exe")
+        exe = os.path.join(self.bin_dir, "llama-server.exe")
         self.mem_idle = gpu_mem_used_mib()
         os.makedirs(RESULTS_DIR, exist_ok=True)
         self._logpath = os.path.join(RESULTS_DIR, "_llama_server.log")
@@ -73,10 +76,12 @@ class LlamaServerRunner:
         self._logf = open(self._logpath, "w", encoding="utf-8", errors="replace")
         self.proc = subprocess.Popen(
             # --jinja enables the full chat template so chat_template_kwargs
-            # (enable_thinking=false) is honored.
+            # (enable_thinking=false) is honored. extra_args carries MTP flags
+            # (--mtp-head <drafter> --spec-type mtp) for the speculative runs.
             [exe, "-m", self.gguf, "--port", str(self.port),
-             "-ngl", str(self.ngl), "-c", str(self.ctx), "--no-webui", "--jinja"],
-            stdout=self._logf, stderr=subprocess.STDOUT, cwd=LLAMA_BIN_DIR,
+             "-ngl", str(self.ngl), "-c", str(self.ctx), "--no-webui", "--jinja"]
+            + self.extra_args,
+            stdout=self._logf, stderr=subprocess.STDOUT, cwd=self.bin_dir,
         )
         self._wait_ready()
         self.mem_loaded = gpu_mem_used_mib()
@@ -144,9 +149,17 @@ class LlamaServerRunner:
         tokens = int(tim.get("predicted_n") or data.get("usage", {}).get("completion_tokens", 0))
         ms = round(float(tim.get("predicted_ms", 0.0)), 1)
         tok_s = round(tokens / (ms / 1000), 2) if ms > 0 else 0.0
+        # Speculative-decoding telemetry (present only on MTP/draft runs). Field
+        # names vary across builds, so probe the likely ones.
+        draft_n = tim.get("draft_n") or tim.get("n_draft")
+        draft_acc = tim.get("draft_n_accepted") or tim.get("n_draft_accepted")
+        accept_rate = (round(draft_acc / draft_n, 3)
+                       if draft_n and draft_acc is not None else None)
         return {"answer": answer, "reasoning": reasoning, "tokens": tokens,
                 "tok_s": tok_s, "ms": ms, "peak_vram_mib": peak,
-                "finish": choice.get("finish_reason", "")}
+                "finish": choice.get("finish_reason", ""),
+                "draft_n": draft_n, "draft_accepted": draft_acc,
+                "accept_rate": accept_rate}
 
 
 # --- report writing ------------------------------------------------------
@@ -179,12 +192,16 @@ def write_report(label: str, meta: dict, rows: list[dict]) -> str:
     if truncated:
         L.append(f"> ⚠️ Truncated at token cap (raise max_tokens): {', '.join(truncated)}\n")
 
+    has_accept = any(r.get("accept_rate") is not None for r in rows)
     L.append("## Summary\n")
-    L.append("| # | id | category | entropy | tokens | tok/s | latency (ms) | finish | peak VRAM (MiB) |")
-    L.append("|---|----|----------|---------|-------:|------:|-------------:|--------|----------------:|")
+    acc_h = " accept |" if has_accept else ""
+    acc_sep = "-------:|" if has_accept else ""
+    L.append(f"| # | id | category | entropy | tokens | tok/s |{acc_h} latency (ms) | finish | peak VRAM (MiB) |")
+    L.append(f"|---|----|----------|---------|-------:|------:|{acc_sep}-------------:|--------|----------------:|")
     for i, r in enumerate(rows, 1):
+        acc_c = f" {r.get('accept_rate')} |" if has_accept else ""
         L.append(f"| {i} | {r['id']} | {r['category']} | {r['entropy']} | "
-                 f"{r['tokens']} | {r['tok_s']} | {r['ms']} | {r.get('finish','')} | {r['peak_vram_mib']} |")
+                 f"{r['tokens']} | {r['tok_s']} |{acc_c} {r['ms']} | {r.get('finish','')} | {r['peak_vram_mib']} |")
     L.append("")
 
     L.append("## Full answers (for quality comparison across versions)\n")
@@ -251,7 +268,16 @@ def main():
     ap.add_argument("--ngl", type=int, default=99)
     ap.add_argument("--ctx", type=int, default=4096)
     ap.add_argument("--gguf", default=DEFAULT_GGUF)
+    ap.add_argument("--llama-bin", default=LLAMA_BIN_DIR,
+                    help="dir with llama-server.exe (use the MTP fork build for MTP runs)")
+    ap.add_argument("--mtp-head", default=None,
+                    help="path to the gemma4_assistant drafter GGUF; enables MTP spec decoding")
+    ap.add_argument("--spec-type", default="mtp", help="speculation type when --mtp-head is set")
     args = ap.parse_args()
+
+    extra_args = []
+    if args.mtp_head:
+        extra_args += ["--mtp-head", args.mtp_head, "--spec-type", args.spec_type]
 
     with open(PROMPTS_PATH, encoding="utf-8") as f:
         suite = json.load(f)
@@ -264,9 +290,11 @@ def main():
     except Exception:
         pass
 
-    print(f"Starting llama-server on port {args.port} ...")
+    print(f"Starting llama-server on port {args.port} "
+          f"{'(MTP spec decoding)' if args.mtp_head else '(autoregressive)'} ...")
     rows = []
-    with LlamaServerRunner(args.gguf, args.port, args.ngl, args.ctx) as runner:
+    with LlamaServerRunner(args.gguf, args.port, args.ngl, args.ctx,
+                           bin_dir=args.llama_bin, extra_args=extra_args) as runner:
         print(f"Model loaded (VRAM {runner.mem_loaded} MiB). Running {len(suite['prompts'])} prompts...")
         for p in suite["prompts"]:
             print(f"  -> {p['id']} ...", end="", flush=True)
@@ -274,7 +302,8 @@ def main():
             res.update({"id": p["id"], "category": p["category"],
                         "entropy": p["entropy"], "prompt": p["prompt"]})
             rows.append(res)
-            print(f" {res['tok_s']} tok/s, {res['tokens']} tok")
+            acc = f", accept {res['accept_rate']}" if res.get("accept_rate") is not None else ""
+            print(f" {res['tok_s']} tok/s, {res['tokens']} tok{acc}")
         meta = {
             "utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "backend": "llama.cpp server",
