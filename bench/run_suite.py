@@ -248,7 +248,8 @@ def append_journal(label: str, meta: dict, avg_tok_s: float, report_path: str):
                 except (IndexError, ValueError):
                     pass
     if baseline:
-        delta = f"+{round((avg_tok_s / baseline - 1) * 100, 1)}%"
+        pct = round((avg_tok_s / baseline - 1) * 100, 1)
+        delta = f"{'+' if pct >= 0 else ''}{pct}%"
     else:
         delta = "— (baseline)"
 
@@ -273,9 +274,13 @@ def main():
     ap.add_argument("--mtp-head", default=None,
                     help="path to the gemma4_assistant drafter GGUF; enables MTP spec decoding")
     ap.add_argument("--spec-type", default="mtp", help="speculation type when --mtp-head is set")
+    ap.add_argument("--fa", default=None, choices=["on", "off", "auto"],
+                    help="flash-attention mode (MTP on Gemma 4 sm_89 requires off)")
     args = ap.parse_args()
 
     extra_args = []
+    if args.fa:
+        extra_args += ["-fa", args.fa]
     if args.mtp_head:
         extra_args += ["--mtp-head", args.mtp_head, "--spec-type", args.spec_type]
 
